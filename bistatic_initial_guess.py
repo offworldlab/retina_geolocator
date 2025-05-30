@@ -1,439 +1,608 @@
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Union
+from dataclasses import dataclass
 import warnings
+from scipy.optimize import fsolve
+from geopy.distance import distance
+from geopy import Point
 
-def find_initial_guess_positions(
-    sensor1_pos: Tuple[float, float],
-    sensor2_pos: Tuple[float, float], 
-    ioo1_pos: Tuple[float, float],
-    ioo2_pos: Optional[Tuple[float, float]],
-    bistatic_range1: float,
-    bistatic_range2: float,
-    complex_threshold_ratio: float = 0.01
-) -> List[Tuple[float, float]]:
-    """
-    Find initial guess positions for bistatic radar target localization using ellipse intersections.
-    
-    Parameters:
-    -----------
-    sensor1_pos : tuple of (x, y) coordinates for sensor 1 (typically at origin)
-    sensor2_pos : tuple of (x, y) coordinates for sensor 2  
-    ioo1_pos : tuple of (x, y) coordinates for illuminator of opportunity 1
-    ioo2_pos : tuple of (x, y) coordinates for illuminator of opportunity 2, or None if shared IoO
-    bistatic_range1 : bistatic range measurement from sensor 1 (km)
-    bistatic_range2 : bistatic range measurement from sensor 2 (km)
-    complex_threshold_ratio : threshold for accepting complex roots (as fraction of bistatic range)
-    
-    Returns:
-    --------
-    List of (x, y) tuples representing potential target positions
-    """
-    
-    # Handle shared IoO case
-    if ioo2_pos is None:
-        ioo2_pos = ioo1_pos
-        print("Using shared IoO configuration")
-    
-    # Convert to numpy arrays for easier computation
-    s1 = np.array(sensor1_pos)
-    s2 = np.array(sensor2_pos) 
-    ioo1 = np.array(ioo1_pos)
-    ioo2 = np.array(ioo2_pos)
-    
-    # Calculate ellipse parameters
-    ellipse1_params = calculate_ellipse_params(s1, ioo1, bistatic_range1)
-    ellipse2_params = calculate_ellipse_params(s2, ioo2, bistatic_range2)
-    
-    # Find intersection points
-    intersections = find_ellipse_intersections(ellipse1_params, ellipse2_params, 
-                                             bistatic_range1, bistatic_range2, 
-                                             complex_threshold_ratio)
-    
-    return intersections
+# Note: Install required packages with:
+# pip install numpy scipy geopy
 
-def calculate_ellipse_params(sensor_pos: np.ndarray, ioo_pos: np.ndarray, bistatic_range: float) -> dict:
-    """
-    Calculate ellipse parameters given sensor, IoO positions and bistatic range.
-    
-    Returns dictionary with ellipse parameters in standard form.
-    """
-    # Calculate baseline distance between sensor and IoO
-    baseline = np.linalg.norm(ioo_pos - sensor_pos)
-    
-    # Semi-major axis: a = (bistatic_range + baseline) / 2
-    a = (bistatic_range + baseline) / 2.0
-    
-    # Semi-minor axis: b = sqrt(a^2 - c^2) where c is half the focal distance
-    c = baseline / 2.0  # Half the distance between foci
-    
-    if a <= c:
-        raise ValueError(f"Invalid ellipse: semi-major axis ({a}) must be greater than focal distance ({c})")
-    
-    b = np.sqrt(a**2 - c**2)
-    
-    # Center of ellipse (midpoint between foci)
-    center = (sensor_pos + ioo_pos) / 2.0
-    
-    # Angle of rotation (angle of major axis from x-axis)
-    focal_vector = ioo_pos - sensor_pos
-    theta = np.arctan2(focal_vector[1], focal_vector[0])
-    
-    return {
-        'center': center,
-        'a': a,  # semi-major axis
-        'b': b,  # semi-minor axis  
-        'theta': theta,  # rotation angle
-        'foci': (sensor_pos, ioo_pos)
-    }
 
-def find_ellipse_intersections(ellipse1: dict, ellipse2: dict, 
-                             bistatic_range1: float, bistatic_range2: float,
-                             complex_threshold_ratio: float) -> List[Tuple[float, float]]:
-    """
-    Find intersection points between two ellipses using algebraic method.
-    """
-    # Transform ellipses to canonical form and solve
-    # This involves converting the rotated ellipses to polynomial form and solving the system
+@dataclass
+class GeoPosition:
+    """Geographic position with latitude, longitude, and optional altitude."""
+    latitude: float
+    longitude: float
+    altitude: float = 0.0  # meters above sea level
     
-    # Get ellipse coefficients in general conic form: Ax² + Bxy + Cy² + Dx + Ey + F = 0
-    A1, B1, C1, D1, E1, F1 = ellipse_to_conic_coefficients(ellipse1)
-    A2, B2, C2, D2, E2, F2 = ellipse_to_conic_coefficients(ellipse2)
-    
-    # Solve the system of two conic equations
-    intersections = solve_conic_intersection(
-        (A1, B1, C1, D1, E1, F1),
-        (A2, B2, C2, D2, E2, F2),
-        max(bistatic_range1, bistatic_range2) * complex_threshold_ratio
-    )
-    
-    return intersections
-
-def ellipse_to_conic_coefficients(ellipse: dict) -> Tuple[float, float, float, float, float, float]:
-    """
-    Convert ellipse parameters to general conic form coefficients.
-    """
-    cx, cy = ellipse['center']
-    a, b = ellipse['a'], ellipse['b']
-    theta = ellipse['theta']
-    
-    cos_t, sin_t = np.cos(theta), np.sin(theta)
-    cos_t2, sin_t2 = cos_t**2, sin_t**2
-    
-    # Coefficients for rotated ellipse: ((x-cx)cosθ + (y-cy)sinθ)²/a² + (-(x-cx)sinθ + (y-cy)cosθ)²/b² = 1
-    A = cos_t2/a**2 + sin_t2/b**2
-    B = 2*cos_t*sin_t*(1/a**2 - 1/b**2)  
-    C = sin_t2/a**2 + cos_t2/b**2
-    D = -2*cx*cos_t2/a**2 - 2*cy*cos_t*sin_t/a**2 - 2*cx*sin_t2/b**2 + 2*cy*cos_t*sin_t/b**2
-    E = -2*cx*cos_t*sin_t/a**2 - 2*cy*sin_t2/a**2 + 2*cx*cos_t*sin_t/b**2 - 2*cy*cos_t2/b**2
-    F = cx**2*cos_t2/a**2 + 2*cx*cy*cos_t*sin_t/a**2 + cy**2*sin_t2/a**2 + cx**2*sin_t2/b**2 - 2*cx*cy*cos_t*sin_t/b**2 + cy**2*cos_t2/b**2 - 1
-    
-    return A, B, C, D, E, F
-
-def solve_conic_intersection(conic1: Tuple[float, ...], conic2: Tuple[float, ...], 
-                           complex_threshold: float) -> List[Tuple[float, float]]:
-    """
-    Solve intersection of two conics using elimination and numpy.roots.
-    """
-    A1, B1, C1, D1, E1, F1 = conic1
-    A2, B2, C2, D2, E2, F2 = conic2
-    
-    valid_points = []
-    
-    # Eliminate y to get polynomial in x
-    # From conic1: C1*y² + (B1*x + E1)*y + (A1*x² + D1*x + F1) = 0
-    # From conic2: C2*y² + (B2*x + E2)*y + (A2*x² + D2*x + F2) = 0
-    
-    # If C1 or C2 is zero, handle as special case
-    if abs(C1) < 1e-12 or abs(C2) < 1e-12:
-        return solve_linear_y_case(conic1, conic2, complex_threshold)
-    
-    # Eliminate y using resultant of two quadratics in y
-    # This gives us a 4th degree polynomial in x
-    poly_coeffs = compute_elimination_polynomial(conic1, conic2)
-    
-    # Find roots using numpy
-    x_roots = np.roots(poly_coeffs)
-    
-    # For each x root, find corresponding y values
-    for x in x_roots:
-        if abs(np.imag(x)) <= complex_threshold:
-            y_solutions = solve_for_y(x, conic1, complex_threshold)
-            for y in y_solutions:
-                if abs(np.imag(y)) <= complex_threshold:
-                    # Verify the point satisfies both conics
-                    if verify_point_on_both_conics(np.real(x), np.real(y), conic1, conic2, complex_threshold):
-                        valid_points.append((float(np.real(x)), float(np.real(y))))
-    
-    return remove_duplicate_points(valid_points)
-
-def compute_elimination_polynomial(conic1: Tuple[float, ...], conic2: Tuple[float, ...]) -> np.ndarray:
-    """
-    Compute the elimination polynomial by eliminating y from two conic equations.
-    Returns coefficients of 4th degree polynomial in x.
-    """
-    A1, B1, C1, D1, E1, F1 = conic1
-    A2, B2, C2, D2, E2, F2 = conic2
-    
-    # Two conics in y:
-    # C1*y² + (B1*x + E1)*y + (A1*x² + D1*x + F1) = 0
-    # C2*y² + (B2*x + E2)*y + (A2*x² + D2*x + F2) = 0
-    
-    # Resultant of two quadratics ay² + by + c and dy² + ey + f is:
-    # (ae - bd)² - (af - cd)(de - b*d) 
-    # But we need the full 4x4 Sylvester matrix approach for accuracy
-    
-    # Coefficients of first quadratic in y: C1, (B1*x + E1), (A1*x² + D1*x + F1)
-    # Coefficients of second quadratic in y: C2, (B2*x + E2), (A2*x² + D2*x + F2)
-    
-    # Build Sylvester matrix for elimination
-    # For quadratics p(y) = a₀ + a₁y + a₂y², q(y) = b₀ + b₁y + b₂y²
-    # Sylvester matrix is 4×4
-    
-    # Polynomial coefficients as functions of x:
-    # p(y): a₀ = A1*x² + D1*x + F1, a₁ = B1*x + E1, a₂ = C1
-    # q(y): b₀ = A2*x² + D2*x + F2, b₁ = B2*x + E2, b₂ = C2
-    
-    # The determinant gives us a polynomial in x of degree 4
-    # We'll compute this step by step
-    
-    # Expansion of the 4×4 Sylvester determinant yields:
-    # coeff_x⁴ term: (A1*C2 - A2*C1)²
-    # coeff_x³ term: 2*(A1*C2 - A2*C1)*(D1*C2 - D2*C1) + (B1*C2 - B2*C1)*(A1*B2 - A2*B1)
-    # ... and so on
-    
-    # For simplicity and accuracy, let's use a more direct approach:
-    # Sample the determinant at several x values and fit polynomial
-    
-    # Alternative: Use direct algebraic elimination
-    # Multiply first equation by C2, second by C1, subtract to eliminate y² term
-    # Then multiply first by (B2*x + E2), second by (B1*x + E1), subtract to eliminate y term
-    
-    # Direct elimination approach:
-    if abs(C1) > 1e-12 and abs(C2) > 1e-12:
-        # Eliminate y² term: C2*(eq1) - C1*(eq2) = 0
-        # This gives: (C2*B1 - C1*B2)*x*y + (C2*E1 - C1*E2)*y + 
-        #            (C2*A1 - C1*A2)*x² + (C2*D1 - C1*D2)*x + (C2*F1 - C1*F2) = 0
+    def to_enu(self, origin: 'GeoPosition') -> 'ENUPosition':
+        """Convert to ENU coordinates relative to origin."""
+        # Using geopy for accurate distance calculations
+        north_dist = distance((origin.latitude, origin.longitude), 
+                            (self.latitude, origin.longitude)).meters
+        east_dist = distance((origin.latitude, origin.longitude), 
+                           (origin.latitude, self.longitude)).meters
         
-        # Call this: α*x*y + β*y + γ*x² + δ*x + ε = 0, so y = -(γ*x² + δ*x + ε)/(α*x + β)
-        alpha = C2*B1 - C1*B2
-        beta = C2*E1 - C1*E2  
-        gamma = C2*A1 - C1*A2
-        delta = C2*D1 - C1*D2
-        epsilon = C2*F1 - C1*F2
+        # Adjust signs based on hemisphere
+        if self.latitude < origin.latitude:
+            north_dist = -north_dist
+        if self.longitude < origin.longitude:
+            east_dist = -east_dist
+            
+        up_dist = self.altitude - origin.altitude
         
-        # Substitute back into first conic equation
-        # C1*y² + (B1*x + E1)*y + (A1*x² + D1*x + F1) = 0
-        # where y = -(γ*x² + δ*x + ε)/(α*x + β)
+        return ENUPosition(east_dist, north_dist, up_dist)
+
+
+@dataclass
+class ENUPosition:
+    """East-North-Up local coordinate system position."""
+    east: float  # meters
+    north: float  # meters
+    up: float = 0.0  # meters
+    
+    def to_array(self) -> np.ndarray:
+        """Convert to numpy array."""
+        return np.array([self.east, self.north, self.up])
+    
+    def to_2d(self) -> np.ndarray:
+        """Get 2D projection (east, north)."""
+        return np.array([self.east, self.north])
+    
+    def to_geo(self, origin: GeoPosition) -> GeoPosition:
+        """Convert back to geographic coordinates."""
+        # Approximate conversion (accurate for small distances)
+        lat_offset = self.north / 111111.0  # meters to degrees
+        lon_offset = self.east / (111111.0 * np.cos(np.radians(origin.latitude)))
         
-        # This will yield a 4th degree polynomial in x
-        # Let's compute it symbolically
+        return GeoPosition(
+            latitude=origin.latitude + lat_offset,
+            longitude=origin.longitude + lon_offset,
+            altitude=origin.altitude + self.up
+        )
+
+
+@dataclass
+class BistaticMeasurement:
+    """Bistatic radar measurement from a single sensor."""
+    sensor_pos: GeoPosition
+    ioo_pos: GeoPosition
+    bistatic_range: float  # meters
+    doppler: Optional[float] = None  # Hz
+    snr: Optional[float] = None  # dB
+    timestamp: Optional[float] = None
+
+
+@dataclass
+class EllipseParameters:
+    """Parameters defining an ellipse in 2D."""
+    center: np.ndarray  # (x, y) center position
+    semi_major: float  # semi-major axis length
+    semi_minor: float  # semi-minor axis length
+    rotation: float  # rotation angle in radians
+    foci: Tuple[np.ndarray, np.ndarray]  # focal points
+
+
+@dataclass
+class TargetSolution:
+    """A potential target position with quality metrics."""
+    position: GeoPosition
+    quality: float  # 0-1, where 1 is perfect intersection
+    gdop: Optional[float] = None
+    crossing_angle: Optional[float] = None
+
+
+class BistaticGeolocation:
+    """Algebraic solver for bistatic radar geolocation."""
+    
+    def __init__(self, altitude_assumption: Optional[float] = None,
+                 range_uncertainty: float = 50.0,
+                 complex_tolerance_factor: float = 0.1):
+        """
+        Initialize the geolocation solver.
         
-        # After substitution and clearing denominators, we get coefficients:
-        poly_coeffs = compute_substitution_polynomial(
-            A1, B1, C1, D1, E1, F1, alpha, beta, gamma, delta, epsilon
+        Parameters:
+        -----------
+        altitude_assumption : float, optional
+            If provided, assumes targets at this altitude (meters).
+            If None, will attempt to estimate altitude.
+        range_uncertainty : float
+            Expected measurement uncertainty in bistatic range (meters).
+            Default: 50m
+        complex_tolerance_factor : float
+            Factor to multiply range_uncertainty for accepting complex roots.
+            Default: 0.1 (accept imaginary parts up to 10% of range uncertainty)
+        """
+        self.altitude_assumption = altitude_assumption
+        self.range_uncertainty = range_uncertainty
+        self.complex_tolerance_factor = complex_tolerance_factor
+        self.origin = None  # Will be set based on sensor positions
+        
+    @dataclass
+    class TargetSolution:
+        """A potential target position with quality metrics."""
+        position: GeoPosition
+        quality: float  # 0-1, where 1 is perfect intersection
+        gdop: Optional[float] = None
+        crossing_angle: Optional[float] = None
+        
+    def find_initial_positions(self, 
+                             measurement1: BistaticMeasurement,
+                             measurement2: BistaticMeasurement) -> List[TargetSolution]:
+        """
+        Find initial target position estimates from two bistatic measurements.
+        
+        Returns:
+        --------
+        List of TargetSolution objects with positions and quality metrics.
+        """
+        # Set coordinate system origin (midpoint between sensors)
+        self._set_origin(measurement1.sensor_pos, measurement2.sensor_pos)
+        
+        # Convert to ENU coordinates
+        sensor1_enu = measurement1.sensor_pos.to_enu(self.origin)
+        sensor2_enu = measurement2.sensor_pos.to_enu(self.origin)
+        ioo1_enu = measurement1.ioo_pos.to_enu(self.origin)
+        ioo2_enu = measurement2.ioo_pos.to_enu(self.origin)
+        
+        solutions = []
+        
+        if self.altitude_assumption is not None:
+            # 2D problem with assumed altitude
+            intersections = self._solve_2d_intersection(
+                sensor1_enu, sensor2_enu, ioo1_enu, ioo2_enu,
+                measurement1.bistatic_range, measurement2.bistatic_range
+            )
+            
+            # Convert to geographic coordinates with quality metrics
+            for pos_2d, quality in intersections:
+                pos_3d = ENUPosition(pos_2d[0], pos_2d[1], self.altitude_assumption)
+                geo_pos = pos_3d.to_geo(self.origin)
+                
+                # Calculate additional metrics
+                metrics = self.calculate_confidence_metrics(measurement1, measurement2, geo_pos)
+                
+                solution = self.TargetSolution(
+                    position=geo_pos,
+                    quality=quality,
+                    gdop=metrics['gdop'],
+                    crossing_angle=metrics['crossing_angle']
+                )
+                solutions.append(solution)
+                
+        else:
+            # 3D problem - find intersection curve and sample altitudes
+            solutions = self._solve_3d_intersection(
+                sensor1_enu, sensor2_enu, ioo1_enu, ioo2_enu,
+                measurement1, measurement2
+            )
+        
+        # Sort by quality
+        solutions.sort(key=lambda s: s.quality, reverse=True)
+        
+        return solutions
+    
+    def _set_origin(self, pos1: GeoPosition, pos2: GeoPosition):
+        """Set the origin for the ENU coordinate system."""
+        self.origin = GeoPosition(
+            latitude=(pos1.latitude + pos2.latitude) / 2,
+            longitude=(pos1.longitude + pos2.longitude) / 2,
+            altitude=(pos1.altitude + pos2.altitude) / 2
+        )
+    
+    def _solve_2d_intersection(self, 
+                              sensor1: ENUPosition, sensor2: ENUPosition,
+                              ioo1: ENUPosition, ioo2: ENUPosition,
+                              range1: float, range2: float) -> List[Tuple[np.ndarray, float]]:
+        """
+        Solve ellipse intersection in 2D using algebraic methods.
+        
+        Returns:
+        --------
+        List of tuples (position, quality) where position is [x, y] array
+        and quality is 0-1.
+        """
+        
+        # Calculate ellipse parameters
+        ellipse1 = self._calculate_ellipse_params(
+            sensor1.to_2d(), ioo1.to_2d(), range1
+        )
+        ellipse2 = self._calculate_ellipse_params(
+            sensor2.to_2d(), ioo2.to_2d(), range2
         )
         
-    else:
-        # Handle degenerate cases where one C coefficient is zero
-        poly_coeffs = np.array([1, 0, 0, 0, 0])  # Placeholder - implement special cases
-    
-    return poly_coeffs
-
-def compute_substitution_polynomial(A1, B1, C1, D1, E1, F1, alpha, beta, gamma, delta, epsilon):
-    """
-    Compute coefficients of 4th degree polynomial after substitution.
-    """
-    # y = -(gamma*x² + delta*x + epsilon)/(alpha*x + beta)
-    # Substitute into: C1*y² + (B1*x + E1)*y + (A1*x² + D1*x + F1) = 0
-    # Multiply through by (alpha*x + beta)² to clear denominators
-    
-    # The resulting polynomial will have degree 4 in x
-    # Coefficients computed by expanding the substitution
-    
-    if abs(alpha) < 1e-12 and abs(beta) < 1e-12:
-        # Special case - return high-degree zero polynomial  
-        return np.array([0, 0, 0, 0, 1])
-    
-    # For numerical stability, let's use a more robust approach
-    # We'll evaluate the constraint at multiple x values and solve for intersections
-    
-    x_test = np.linspace(-100, 100, 200)
-    valid_x = []
-    
-    for x in x_test:
-        denom = alpha*x + beta
-        if abs(denom) > 1e-12:
-            y = -(gamma*x**2 + delta*x + epsilon) / denom
-            
-            # Check if this (x,y) satisfies the original first conic
-            val1 = A1*x**2 + B1*x*y + C1*y**2 + D1*x + E1*y + F1
-            if abs(val1) < 1e-6:  # Tolerance for numerical errors
-                valid_x.append(x)
-    
-    if len(valid_x) == 0:
-        return np.array([0, 0, 0, 0, 1])
-    
-    # If we have valid x values, we can construct a polynomial
-    # For now, return a simple polynomial - in practice you'd fit through the points
-    if len(valid_x) >= 1:
-        # Create polynomial with roots at valid_x locations
-        poly = np.poly(valid_x[:4])  # Take up to 4 roots for degree 4 polynomial
-        if len(poly) > 5:
-            poly = poly[:5]  # Truncate to degree 4
-        while len(poly) < 5:
-            poly = np.append([0], poly)  # Pad with leading zeros
-        return poly
-    
-    return np.array([0, 0, 0, 0, 1])
-
-def solve_linear_y_case(conic1: Tuple[float, ...], conic2: Tuple[float, ...], 
-                       complex_threshold: float) -> List[Tuple[float, float]]:
-    """
-    Handle case where one or both conics are linear in y.
-    """
-    A1, B1, C1, D1, E1, F1 = conic1
-    A2, B2, C2, D2, E2, F2 = conic2
-    
-    valid_points = []
-    
-    # If C1 ≈ 0: B1*x*y + E1*y = -(A1*x² + D1*x + F1), so y = -(A1*x² + D1*x + F1)/(B1*x + E1)
-    # If C2 ≈ 0: B2*x*y + E2*y = -(A2*x² + D2*x + F2), so y = -(A2*x² + D2*x + F2)/(B2*x + E2)
-    
-    if abs(C1) < 1e-12:
-        # First conic is linear in y
-        # Substitute y expression into second conic
-        x_vals = solve_by_substitution_linear(conic1, conic2, complex_threshold)
-    elif abs(C2) < 1e-12:
-        # Second conic is linear in y  
-        x_vals = solve_by_substitution_linear(conic2, conic1, complex_threshold)
-    else:
-        x_vals = []
-    
-    # Convert x values to (x,y) points
-    for x in x_vals:
-        if abs(np.imag(x)) <= complex_threshold:
-            y_solutions = solve_for_y(x, conic1, complex_threshold)
-            for y in y_solutions:
-                if abs(np.imag(y)) <= complex_threshold:
-                    valid_points.append((float(np.real(x)), float(np.real(y))))
-    
-    return valid_points
-
-def solve_by_substitution_linear(linear_conic: Tuple[float, ...], quad_conic: Tuple[float, ...],
-                               complex_threshold: float) -> List[complex]:
-    """
-    Solve by substituting linear y expression into quadratic conic.
-    """
-    A1, B1, C1, D1, E1, F1 = linear_conic  # C1 should be ≈ 0
-    A2, B2, C2, D2, E2, F2 = quad_conic
-    
-    # From linear: y = -(A1*x² + D1*x + F1)/(B1*x + E1)
-    # Substitute into quadratic conic and solve for x
-    
-    x_samples = np.linspace(-100, 100, 1000)
-    x_solutions = []
-    
-    for x in x_samples:
-        denom = B1*x + E1
-        if abs(denom) > 1e-12:
-            y = -(A1*x**2 + D1*x + F1) / denom
-            # Check if (x,y) satisfies the quadratic conic
-            val = A2*x**2 + B2*x*y + C2*y**2 + D2*x + E2*y + F2
-            if abs(val) < 1e-6:
-                x_solutions.append(x)
-    
-    return x_solutions[:4]  # Return up to 4 solutions
-
-def verify_point_on_both_conics(x: float, y: float, conic1: Tuple[float, ...], 
-                               conic2: Tuple[float, ...], tolerance: float) -> bool:
-    """
-    Verify that a point satisfies both conic equations within tolerance.
-    """
-    A1, B1, C1, D1, E1, F1 = conic1
-    A2, B2, C2, D2, E2, F2 = conic2
-    
-    val1 = A1*x**2 + B1*x*y + C1*y**2 + D1*x + E1*y + F1
-    val2 = A2*x**2 + B2*x*y + C2*y**2 + D2*x + E2*y + F2
-    
-    return abs(val1) < tolerance and abs(val2) < tolerance
-
-def remove_duplicate_points(points: List[Tuple[float, float]], tolerance: float = 0.1) -> List[Tuple[float, float]]:
-    """
-    Remove duplicate points within tolerance.
-    """
-    unique_points = []
-    for point in points:
-        is_duplicate = False
-        for existing in unique_points:
-            if abs(point[0] - existing[0]) < tolerance and abs(point[1] - existing[1]) < tolerance:
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            unique_points.append(point)
-    return unique_points
-
-def solve_for_y(x: complex, conic: Tuple[float, ...], complex_threshold: float) -> List[complex]:
-    """
-    Solve for y given x and conic equation using numpy.roots.
-    Conic equation: Ax² + Bxy + Cy² + Dx + Ey + F = 0
-    Rearranged as quadratic in y: Cy² + (Bx + E)y + (Ax² + Dx + F) = 0
-    """
-    A, B, C, D, E, F = conic
-    
-    # Coefficients of quadratic in y: ay² + by + c = 0
-    a = C
-    b = B*x + E  
-    c = A*x**2 + D*x + F
-    
-    if abs(a) > 1e-12:
-        # Use numpy.roots to solve quadratic
-        coeffs = [a, b, c]
-        roots = np.roots(coeffs)
+        # Find intersections using algebraic method with quality tracking
+        intersections = self._algebraic_ellipse_intersection(ellipse1, ellipse2)
         
-        # Filter roots based on complex threshold
-        valid_roots = []
+        return intersections
+    
+    def _calculate_ellipse_params(self, sensor: np.ndarray, ioo: np.ndarray, 
+                                 bistatic_range: float) -> EllipseParameters:
+        """Calculate ellipse parameters from sensor, IoO, and bistatic range."""
+        
+        # Baseline distance between sensor and IoO
+        baseline = np.linalg.norm(ioo - sensor)
+        
+        # For a valid ellipse: bistatic_range > baseline
+        if bistatic_range <= baseline:
+            raise ValueError(f"Invalid geometry: bistatic range ({bistatic_range}m) "
+                           f"must be greater than baseline ({baseline}m)")
+        
+        # Semi-major axis: sum of distances to foci = bistatic_range
+        a = bistatic_range / 2.0
+        
+        # Distance between foci
+        c = baseline / 2.0
+        
+        # Semi-minor axis
+        b = np.sqrt(a**2 - c**2)
+        
+        # Center (midpoint between foci)
+        center = (sensor + ioo) / 2.0
+        
+        # Rotation angle
+        focal_vector = ioo - sensor
+        rotation = np.arctan2(focal_vector[1], focal_vector[0])
+        
+        return EllipseParameters(
+            center=center,
+            semi_major=a,
+            semi_minor=b,
+            rotation=rotation,
+            foci=(sensor, ioo)
+        )
+    
+    def _algebraic_ellipse_intersection(self, ellipse1: EllipseParameters, 
+                                      ellipse2: EllipseParameters) -> List[Tuple[np.ndarray, float]]:
+        """
+        Find intersection points of two ellipses using algebraic methods.
+        
+        Returns:
+        --------
+        List of tuples (position, quality) where position is [x, y] and
+        quality is 0-1 (1 = perfect intersection, <1 = near miss).
+        """
+        
+        # Convert ellipses to implicit form: Ax² + Bxy + Cy² + Dx + Ey + F = 0
+        coeffs1 = self._ellipse_to_implicit(ellipse1)
+        coeffs2 = self._ellipse_to_implicit(ellipse2)
+        
+        # Use Sylvester resultant to eliminate y
+        x_polynomial = self._compute_resultant_x(coeffs1, coeffs2)
+        
+        # Find roots including those with small imaginary parts
+        x_roots_with_quality = self._find_real_roots(x_polynomial)
+        
+        # For each x, find corresponding y values
+        intersection_points = []
+        for x_real, x_imag_mag in x_roots_with_quality:
+            y_values = self._solve_for_y_with_quality(x_real, coeffs1, coeffs2)
+            
+            for y_real, y_imag_mag in y_values:
+                # Calculate overall solution quality
+                total_imag = np.sqrt(x_imag_mag**2 + y_imag_mag**2)
+                quality = np.exp(-total_imag / self.range_uncertainty)  # Exponential decay
+                
+                # Verify the point lies approximately on both ellipses
+                if self._verify_intersection(x_real, y_real, coeffs1, coeffs2):
+                    intersection_points.append((np.array([x_real, y_real]), quality))
+                elif quality > 0.5:  # Accept near-misses with good quality
+                    intersection_points.append((np.array([x_real, y_real]), quality * 0.8))
+        
+        return intersection_points
+    
+    def _ellipse_to_implicit(self, ellipse: EllipseParameters) -> Dict[str, float]:
+        """
+        Convert ellipse parameters to implicit form coefficients.
+        
+        Returns coefficients for: Ax² + Bxy + Cy² + Dx + Ey + F = 0
+        """
+        h, k = ellipse.center
+        a, b = ellipse.semi_major, ellipse.semi_minor
+        theta = ellipse.rotation
+        
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        
+        # Rotation matrix elements
+        cos2_t = cos_t**2
+        sin2_t = sin_t**2
+        sin_cos_t = sin_t * cos_t
+        
+        # Coefficients
+        A = cos2_t/a**2 + sin2_t/b**2
+        B = 2*sin_cos_t*(1/a**2 - 1/b**2)
+        C = sin2_t/a**2 + cos2_t/b**2
+        D = -2*h*A - k*B
+        E = -h*B - 2*k*C
+        F = h**2*A + h*k*B + k**2*C - 1
+        
+        return {'A': A, 'B': B, 'C': C, 'D': D, 'E': E, 'F': F}
+    
+    def _compute_resultant_x(self, coeffs1: Dict[str, float], 
+                           coeffs2: Dict[str, float]) -> np.ndarray:
+        """
+        Compute the resultant polynomial in x by eliminating y.
+        
+        This uses the Sylvester matrix method to eliminate y from the system
+        of two conic equations.
+        """
+        # Extract coefficients
+        A1, B1, C1 = coeffs1['A'], coeffs1['B'], coeffs1['C']
+        D1, E1, F1 = coeffs1['D'], coeffs1['E'], coeffs1['F']
+        A2, B2, C2 = coeffs2['A'], coeffs2['B'], coeffs2['C']
+        D2, E2, F2 = coeffs2['D'], coeffs2['E'], coeffs2['F']
+        
+        # Build the resultant polynomial coefficients
+        # This is a 4th degree polynomial in x
+        p4 = (B1*E2 - B2*E1)**2 - 4*(A1*E2**2 - 2*A2*E1*E2 + A2*E1**2)*C1 + 4*A1*C2*E1**2
+        
+        p3 = 2*(B1*E2 - B2*E1)*(B1*F2 - B2*F1) - 4*(A1*E2**2 - 2*A2*E1*E2 + A2*E1**2)*D1 + \
+             8*A1*C2*D2*E1 - 4*A2*C1*D1*E2 + 4*A2*C2*D1*E1
+        
+        p2 = (B1*F2 - B2*F1)**2 - 4*(A1*F2 - A2*F1)*(C1*F2 - C2*F1) + \
+             4*A1*C2*D2**2 - 4*A2*C1*D1**2 + 8*A1*C2*F1 - 8*A2*C1*F2
+        
+        p1 = 4*(B1*F2 - B2*F1)*(D1*F2 - D2*F1) - 4*(A1*F2 - A2*F1)*(E1*F2 - E2*F1)
+        
+        p0 = 4*(D1*F2 - D2*F1)**2 - 4*(A1*F2 - A2*F1)*(C1*F2 - C2*F1)
+        
+        return np.array([p4, p3, p2, p1, p0])
+    
+    def _find_real_roots(self, polynomial: np.ndarray, tolerance: float = 1e-10) -> List[Tuple[float, float]]:
+        """
+        Find real roots of a polynomial, including those with small imaginary parts.
+        
+        Returns:
+        --------
+        List of tuples (real_value, imaginary_magnitude) for each acceptable root.
+        """
+        roots = np.roots(polynomial)
+        acceptable_roots = []
+        
+        # Dynamic tolerance based on measurement uncertainty
+        complex_tolerance = self.range_uncertainty * self.complex_tolerance_factor
+        
         for root in roots:
-            if abs(np.imag(root)) <= complex_threshold:
-                valid_roots.append(root)
+            if abs(root.imag) < tolerance:
+                # Pure real root - best quality
+                acceptable_roots.append((root.real, 0.0))
+            elif abs(root.imag) < complex_tolerance:
+                # Small imaginary part - indicates near-miss intersection
+                acceptable_roots.append((root.real, abs(root.imag)))
         
-        return valid_roots
-        
-    elif abs(b) > 1e-12:
-        # Linear equation: by + c = 0
-        y = -c / b
-        if abs(np.imag(y)) <= complex_threshold:
-            return [y]
+        return acceptable_roots
     
-    return []
-
-
-
-# Example usage
-if __name__ == "__main__":
-    # Example with two separate IoOs
-    sensor1_pos = (0.0, 0.0)  # Origin
-    sensor2_pos = (10.0, 5.0)  # 10km east, 5km north
-    ioo1_pos = (15.0, 8.0)    # IoO for sensor 1
-    ioo2_pos = (12.0, -3.0)   # IoO for sensor 2
-    bistatic_range1 = 5.2     # km
-    bistatic_range2 = 4.8     # km
-    
-    try:
-        positions = find_initial_guess_positions(
-            sensor1_pos, sensor2_pos, ioo1_pos, ioo2_pos,
-            bistatic_range1, bistatic_range2
-        )
+    def _solve_for_y_with_quality(self, x: float, coeffs1: Dict[str, float], 
+                                  coeffs2: Dict[str, float]) -> List[Tuple[float, float]]:
+        """
+        Given x, solve for y values with quality metrics.
         
-        print("Potential target positions:")
-        for i, pos in enumerate(positions):
-            print(f"  Position {i+1}: ({pos[0]:.3f}, {pos[1]:.3f}) km")
+        Returns:
+        --------
+        List of tuples (y_real, imaginary_magnitude) for each solution.
+        """
+        y_values = []
+        
+        # Solve first ellipse: C1*y² + (B1*x + E1)*y + (A1*x² + D1*x + F1) = 0
+        A1, B1, C1 = coeffs1['A'], coeffs1['B'], coeffs1['C']
+        D1, E1, F1 = coeffs1['D'], coeffs1['E'], coeffs1['F']
+        
+        a = C1
+        b = B1*x + E1
+        c = A1*x**2 + D1*x + F1
+        
+        if abs(a) > 1e-12:
+            discriminant = b**2 - 4*a*c
+            if discriminant >= 0:
+                sqrt_disc = np.sqrt(discriminant)
+                y1 = (-b + sqrt_disc) / (2*a)
+                y2 = (-b - sqrt_disc) / (2*a)
+                y_values.extend([(y1, 0.0), (y2, 0.0)])
+            else:
+                # Complex roots - check if imaginary part is small enough
+                sqrt_disc = np.sqrt(-discriminant)
+                y_real = -b / (2*a)
+                y_imag = sqrt_disc / (2*a)
+                if y_imag < self.range_uncertainty * self.complex_tolerance_factor:
+                    y_values.extend([(y_real, y_imag)])
+        elif abs(b) > 1e-12:
+            y_values.append((-c/b, 0.0))
+        
+        return y_values
+    
+    def _verify_intersection(self, x: float, y: float, 
+                           coeffs1: Dict[str, float], 
+                           coeffs2: Dict[str, float], 
+                           tolerance: float = 1e-6) -> bool:
+        """Verify that a point lies on both ellipses."""
+        # Check first ellipse
+        val1 = (coeffs1['A']*x**2 + coeffs1['B']*x*y + coeffs1['C']*y**2 + 
+                coeffs1['D']*x + coeffs1['E']*y + coeffs1['F'])
+        
+        # Check second ellipse  
+        val2 = (coeffs2['A']*x**2 + coeffs2['B']*x*y + coeffs2['C']*y**2 + 
+                coeffs2['D']*x + coeffs2['E']*y + coeffs2['F'])
+        
+        return abs(val1) < tolerance and abs(val2) < tolerance
+    
+    def _solve_3d_intersection(self, 
+                              sensor1: ENUPosition, sensor2: ENUPosition,
+                              ioo1: ENUPosition, ioo2: ENUPosition,
+                              measurement1: BistaticMeasurement,
+                              measurement2: BistaticMeasurement) -> List[TargetSolution]:
+        """
+        Solve 3D ellipsoid intersection.
+        
+        Since altitude is unknown but positive, we sample different altitudes
+        and find valid intersections.
+        """
+        solutions = []
+        
+        # Sample altitudes (0 to 15km in 500m steps)
+        altitudes = np.arange(0, 15000, 500)
+        
+        for alt in altitudes:
+            # Project to 2D at this altitude
+            # Adjust ranges based on altitude difference
+            sensor1_alt_diff = alt - sensor1.up
+            sensor2_alt_diff = alt - sensor2.up
+            ioo1_alt_diff = alt - ioo1.up
+            ioo2_alt_diff = alt - ioo2.up
             
-    except Exception as e:
-        print(f"Error: {e}")
+            # Check if geometry is valid at this altitude
+            range1_sq = measurement1.bistatic_range**2
+            range2_sq = measurement2.bistatic_range**2
+            alt_contribution1_sq = (sensor1_alt_diff + ioo1_alt_diff)**2
+            alt_contribution2_sq = (sensor2_alt_diff + ioo2_alt_diff)**2
+            
+            if range1_sq > alt_contribution1_sq and range2_sq > alt_contribution2_sq:
+                # Corrected 2D ranges (using Pythagorean theorem)
+                range1_2d = np.sqrt(range1_sq - alt_contribution1_sq)
+                range2_2d = np.sqrt(range2_sq - alt_contribution2_sq)
+                
+                try:
+                    intersections_2d = self._solve_2d_intersection(
+                        sensor1, sensor2, ioo1, ioo2, range1_2d, range2_2d
+                    )
+                    
+                    for pos_2d, quality in intersections_2d:
+                        pos_3d = ENUPosition(pos_2d[0], pos_2d[1], alt)
+                        geo_pos = pos_3d.to_geo(self.origin)
+                        
+                        # Calculate additional metrics
+                        metrics = self.calculate_confidence_metrics(
+                            measurement1, measurement2, geo_pos
+                        )
+                        
+                        # Adjust quality based on altitude uncertainty
+                        # Prefer solutions near typical aircraft altitudes
+                        alt_quality = np.exp(-((alt - 8000)**2) / (5000**2))
+                        combined_quality = quality * 0.8 + alt_quality * 0.2
+                        
+                        solution = TargetSolution(
+                            position=geo_pos,
+                            quality=combined_quality,
+                            gdop=metrics['gdop'],
+                            crossing_angle=metrics['crossing_angle']
+                        )
+                        solutions.append(solution)
+                        
+                except ValueError:
+                    # Invalid geometry at this altitude
+                    continue
         
-    # Example with shared IoO
-    print("\nShared IoO example:")
-    shared_positions = find_initial_guess_positions(
-        sensor1_pos, sensor2_pos, ioo1_pos, None,  # None for shared IoO
-        bistatic_range1, bistatic_range2
+        return solutions
+    
+    def calculate_confidence_metrics(self, 
+                                   measurement1: BistaticMeasurement,
+                                   measurement2: BistaticMeasurement,
+                                   target_pos: GeoPosition) -> Dict[str, float]:
+        """
+        Calculate confidence metrics for a target position.
+        
+        Returns:
+        --------
+        Dictionary with confidence metrics:
+        - gdop: Geometric dilution of precision
+        - crossing_angle: Angle between ellipses at intersection (degrees)
+        - snr_factor: Combined SNR factor if available
+        """
+        # Convert to ENU
+        target_enu = target_pos.to_enu(self.origin)
+        sensor1_enu = measurement1.sensor_pos.to_enu(self.origin)
+        sensor2_enu = measurement2.sensor_pos.to_enu(self.origin)
+        
+        # Calculate crossing angle
+        vec1 = target_enu.to_2d() - sensor1_enu.to_2d()
+        vec2 = target_enu.to_2d() - sensor2_enu.to_2d()
+        
+        angle1 = np.arctan2(vec1[1], vec1[0])
+        angle2 = np.arctan2(vec2[1], vec2[0])
+        crossing_angle = np.degrees(abs(angle1 - angle2))
+        
+        # Normalize to 0-90 degrees
+        if crossing_angle > 90:
+            crossing_angle = 180 - crossing_angle
+        
+        # Calculate GDOP (simplified)
+        # Better crossing angles (near 90°) give lower GDOP
+        gdop = 1.0 / np.sin(np.radians(crossing_angle))
+        
+        # SNR factor
+        snr_factor = 1.0
+        if measurement1.snr and measurement2.snr:
+            snr_factor = np.sqrt(measurement1.snr * measurement2.snr)
+        
+        return {
+            'gdop': gdop,
+            'crossing_angle': crossing_angle,
+            'snr_factor': snr_factor,
+            'confidence': min(crossing_angle / 90.0, 1.0) * min(snr_factor / 20.0, 1.0)
+        }
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Create measurement data
+    measurement1 = BistaticMeasurement(
+        sensor_pos=GeoPosition(latitude=40.0, longitude=-74.0, altitude=100),
+        ioo_pos=GeoPosition(latitude=40.1, longitude=-73.9, altitude=200),
+        bistatic_range=15000,  # 15 km
+        snr=20.0
     )
+    
+    measurement2 = BistaticMeasurement(
+        sensor_pos=GeoPosition(latitude=40.05, longitude=-74.05, altitude=150),
+        ioo_pos=GeoPosition(latitude=40.08, longitude=-73.95, altitude=180),
+        bistatic_range=12000,  # 12 km
+        snr=18.0
+    )
+    
+    # Create solver (2D with assumed altitude)
+    # Note: range_uncertainty=50m means we'll accept roots with imaginary parts up to 5m
+    solver = BistaticGeolocation(
+        altitude_assumption=5000,  # 5km altitude
+        range_uncertainty=50.0,    # 50m measurement uncertainty
+        complex_tolerance_factor=0.1  # Accept imaginary parts up to 10% of uncertainty
+    )
+    
+    # Find initial positions
+    try:
+        solutions = solver.find_initial_positions(measurement1, measurement2)
+        
+        print(f"Found {len(solutions)} potential target positions:")
+        for i, sol in enumerate(solutions):
+            print(f"\nPosition {i+1}:")
+            print(f"  Latitude: {sol.position.latitude:.6f}°")
+            print(f"  Longitude: {sol.position.longitude:.6f}°")
+            print(f"  Altitude: {sol.position.altitude:.1f} m")
+            print(f"  Solution Quality: {sol.quality:.3f}")
+            print(f"  GDOP: {sol.gdop:.2f}")
+            print(f"  Crossing angle: {sol.crossing_angle:.1f}°")
+            
+            # Flag near-miss solutions
+            if sol.quality < 0.95:
+                print("  ⚠️  Near-miss solution (ellipses don't perfectly intersect)")
+            
+    except ValueError as e:
+        print(f"Error: {e}")
+    
+    # Test 3D solver (unknown altitude)
+    print("\n\nTesting 3D solver with unknown altitude:")
+    solver_3d = BistaticGeolocation(
+        altitude_assumption=None,
+        range_uncertainty=100.0  # Higher uncertainty for 3D case
+    )
+    
+    solutions_3d = solver_3d.find_initial_positions(measurement1, measurement2)
+    print(f"Found {len(solutions_3d)} potential positions at various altitudes")
+    
+    # Show top 5 solutions
+    print("\nTop 5 solutions by quality:")
+    for i, sol in enumerate(solutions_3d[:5]):
+        print(f"{i+1}. Alt={sol.position.altitude:.0f}m, "
+              f"Quality={sol.quality:.3f}, "
+              f"GDOP={sol.gdop:.2f}")
